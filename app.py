@@ -1,24 +1,29 @@
+import os
+import re
 import io
 import json
-import re
-import shutil
-import subprocess
-import sys
 import time
 import zipfile
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+except Exception:
+    sync_playwright = None
+    PlaywrightTimeoutError = Exception
 
-st.set_page_config(page_title="UAnalyze 產業情報長時間爬蟲", layout="wide")
 
-RUNS_DIR = Path("runs")
-RUNS_DIR.mkdir(exist_ok=True)
+APP_TITLE = "UAnalyze 產業情報小助理爬蟲"
+LOGIN_URL_DEFAULT = "https://pro.uanalyze.com.tw/login-page"
+DASHBOARD_URL_DEFAULT = "https://pro.uanalyze.com.tw/lab/dashboard/41873"
 
-TOPICS = [
+DEFAULT_TOPICS = [
     "近況發展",
     "產業趨勢",
     "產品線分析",
@@ -41,886 +46,849 @@ TOPICS = [
     "名詞解釋",
 ]
 
-
-# -----------------------------
-# UI helpers
-# -----------------------------
-
-def safe_name(text: str) -> str:
-    text = str(text or "").strip()
-    text = re.sub(r'[\\/:*?"<>|]', "_", text)
-    text = re.sub(r"\s+", "_", text)
-    return text[:90] or "untitled"
-
-
-def now_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def human_now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def copy_button(text: str, label: str = "一鍵複製全部爬蟲結果"):
-    safe_text = json.dumps(text or "", ensure_ascii=False)
-
-    components.html(
-        f"""
-        <div style="margin: 12px 0;">
-            <button
-                onclick="copyTextToClipboard()"
-                style="
-                    background-color:#ff9800;
-                    color:#111;
-                    border:none;
-                    border-radius:10px;
-                    padding:14px 18px;
-                    font-size:18px;
-                    font-weight:700;
-                    cursor:pointer;
-                    width:100%;
-                    max-width:520px;
-                "
-            >
-                📋 {label}
-            </button>
-            <div id="copy-status" style="margin-top:10px;color:#20c997;font-size:16px;"></div>
-        </div>
-
-        <script>
-        const textToCopy = {safe_text};
-
-        async function copyTextToClipboard() {{
-            const status = document.getElementById("copy-status");
-
-            try {{
-                await navigator.clipboard.writeText(textToCopy);
-                status.innerText = "已複製到剪貼簿";
-            }} catch (err) {{
-                const textarea = document.createElement("textarea");
-                textarea.value = textToCopy;
-                textarea.style.position = "fixed";
-                textarea.style.left = "0";
-                textarea.style.top = "0";
-                textarea.style.width = "1px";
-                textarea.style.height = "1px";
-                textarea.style.opacity = "0";
-                document.body.appendChild(textarea);
-                textarea.focus();
-                textarea.select();
-
-                try {{
-                    document.execCommand("copy");
-                    status.innerText = "已複製到剪貼簿";
-                }} catch (fallbackErr) {{
-                    status.innerText = "複製失敗，請改用下方文字框長按複製";
-                }}
-
-                document.body.removeChild(textarea);
-            }}
-        }}
-        </script>
-        """,
-        height=105,
-    )
-
-
-def build_zip_bytes(run_dir: Path) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        for path in run_dir.rglob("*"):
-            if path.is_file():
-                z.write(path, path.relative_to(run_dir))
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def latest_run_dirs(limit: int = 5):
-    dirs = [p for p in RUNS_DIR.iterdir() if p.is_dir()]
-    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return dirs[:limit]
+OUT_DIR = Path("/tmp/uanalyze_crawler_outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------------
-# Playwright helpers
+# 基礎工具
 # -----------------------------
 
-@st.cache_resource(show_spinner=False)
-def ensure_playwright_chromium() -> dict:
-    """Run once per container lifetime. This saves time on long runs."""
-    result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return {
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+def normalize_stock_code(raw: str) -> str:
+    """
+    只取股票代號。
+    例如：
+    - 3030_德律 -> 3030
+    - 3030 德律 -> 3030
+    - 德律3030 -> 3030
+    """
+    raw = (raw or "").strip()
+    m = re.search(r"(\d{4,6})", raw)
+    return m.group(1) if m else raw
 
 
-def clean_text(text: str) -> str:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-
-    skip_exact = {
-        "深色主題",
-        "帳戶和訂閱",
-        "最新公告",
-        "我的訂閱",
-        "商城",
-        "使用教學",
-        "幫助",
-        "產業達人",
-    }
-
-    lines = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            if lines and lines[-1] != "":
-                lines.append("")
-            continue
-        if line in skip_exact:
-            continue
-        lines.append(line)
-
-    return "\n".join(lines).strip()
+def safe_filename(s: str) -> str:
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", str(s))
+    s = re.sub(r"\s+", "_", s).strip("_")
+    return s[:120] or "uanalyze"
 
 
-def extract_body_text(page) -> str:
+def run_cmd(cmd: List[str], timeout: int = 180) -> Tuple[int, str]:
     try:
-        return clean_text(page.locator("body").inner_text(timeout=15000))
-    except Exception:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 999, str(e)
+
+
+def ensure_playwright_chromium() -> str:
+    """
+    Streamlit Cloud 上第一次跑時，可能需要安裝 Chromium。
+    這裡做一次性檢查，避免每次重裝。
+    """
+    marker = Path("/tmp/uanalyze_playwright_chromium_ready")
+    if marker.exists():
+        return "Playwright Chromium 已準備完成。"
+
+    if sync_playwright is None:
+        return "Playwright 尚未安裝，請確認 requirements.txt 有 playwright。"
+
+    # 安裝 chromium。若已安裝，這行通常很快。
+    code, out = run_cmd(["python", "-m", "playwright", "install", "chromium"], timeout=240)
+    if code == 0:
+        marker.write_text(datetime.now().isoformat(), encoding="utf-8")
+        return "Playwright Chromium 安裝 / 檢查完成。"
+    return f"Playwright Chromium 安裝可能失敗：\n{out[-2000:]}"
+
+
+def text_contains_login_fields(text: str) -> bool:
+    keywords = ["Facebook 登入", "Google 登入", "Apple 登入", "忘記密碼", "無法登入", "Email", "密碼"]
+    return sum(k in text for k in keywords) >= 3
+
+
+def strip_repeated_noise(text: str) -> str:
+    if not text:
         return ""
 
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
 
-def close_blockers(page):
-    actions = []
+    # 移除常見頁尾 / cookie 長文，避免每個欄位重複塞爆
+    cut_patterns = [
+        "EPS法人預估",
+        "優分析 UAnalyze 特別聲明",
+        "服務條款|免責聲明|隱私權政策",
+        "本網站使用 Cookie 技術",
+    ]
+    # 注意：這個函式不一定要砍到 EPS；主抽取函式會更精準切。
+    return text.strip()
 
-    try:
-        if page.get_by_text("重新整理", exact=False).count() > 0:
-            page.get_by_text("重新整理", exact=False).first.click(timeout=5000)
-            actions.append("clicked 重新整理")
-            page.wait_for_timeout(7000)
-    except Exception:
-        pass
 
-    try:
-        body = page.locator("body").inner_text(timeout=5000)
-        if "系統已有更新" in body or "請重新整理" in body:
-            page.reload(wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(8000)
-            actions.append("page.reload")
-    except Exception:
-        pass
+def detect_current_stock(text: str) -> Tuple[str, str]:
+    """
+    回傳 (stock_code, stock_name)。抓不到就回空字串。
+    """
+    text = text or ""
 
-    for t in ["我知道了", "同意", "接受", "接受所有", "OK"]:
-        try:
-            if page.get_by_text(t, exact=False).count() > 0:
-                page.get_by_text(t, exact=False).last.click(timeout=5000)
-                actions.append(f"clicked {t}")
-                page.wait_for_timeout(2000)
+    code = ""
+    name = ""
+
+    patterns = [
+        r"股票代碼[:：]\s*\n?\s*(\d{4,6})",
+        r"股票代碼\s*\n?\s*(\d{4,6})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            code = m.group(1)
+            break
+
+    name_patterns = [
+        r"股票名稱[:：]\s*\n?\s*([^\n\r]+)",
+        r"股票名稱\s*\n?\s*([^\n\r]+)",
+    ]
+    for pat in name_patterns:
+        m = re.search(pat, text)
+        if m:
+            cand = m.group(1).strip()
+            if cand and len(cand) <= 20:
+                name = cand
                 break
+
+    # 後備：常見格式「台泥 \n 1101 \n 24.50%」
+    if not code:
+        m = re.search(r"\n([^\n]{1,20})\n(\d{4,6})\n", "\n" + text)
+        if m:
+            name, code = m.group(1).strip(), m.group(2).strip()
+
+    return code, name
+
+
+def infer_company_from_text(text: str) -> str:
+    code, name = detect_current_stock(text)
+    if code and name:
+        return f"{code}_{name}"
+    if code:
+        return code
+    return ""
+
+
+def make_copy_button(markdown_text: str, button_label: str = "📋 一鍵複製全部爬蟲結果"):
+    """
+    Streamlit 原生按鈕不能直接寫入手機剪貼簿，所以用小段 HTML/JS。
+    """
+    payload = json.dumps(markdown_text)
+    components.html(
+        f"""
+        <div style="margin: 8px 0 18px 0;">
+          <button id="copy_btn" style="
+            width:100%;
+            background:#ff9800;
+            color:#111;
+            border:none;
+            border-radius:12px;
+            padding:14px 16px;
+            font-size:18px;
+            font-weight:700;
+            cursor:pointer;">
+            {button_label}
+          </button>
+          <div id="copy_msg" style="color:#41d37e; font-size:15px; margin-top:8px;"></div>
+        </div>
+        <script>
+        const text = {payload};
+        const btn = document.getElementById("copy_btn");
+        const msg = document.getElementById("copy_msg");
+        btn.onclick = async () => {{
+            try {{
+                await navigator.clipboard.writeText(text);
+                msg.innerText = "已複製到剪貼簿";
+            }} catch (e) {{
+                const ta = document.createElement("textarea");
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                msg.innerText = "已複製到剪貼簿";
+            }}
+        }};
+        </script>
+        """,
+        height=95,
+    )
+
+
+def make_zip_bytes(files: Dict[str, bytes]) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    return bio.getvalue()
+
+
+# -----------------------------
+# Playwright 互動工具
+# -----------------------------
+
+def click_cookie_if_any(page):
+    texts = ["我知道了", "接受", "同意", "OK"]
+    for t in texts:
+        try:
+            loc = page.get_by_text(t, exact=True)
+            if loc.count() > 0:
+                loc.last.click(timeout=1500)
+                page.wait_for_timeout(500)
+                return True
         except Exception:
             pass
+    return False
 
-    return actions
+
+def fill_first_visible(page, selectors: List[str], value: str) -> bool:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = loc.count()
+            for i in range(min(count, 5)):
+                item = loc.nth(i)
+                if item.is_visible(timeout=800):
+                    item.click(timeout=1500)
+                    item.fill(value, timeout=3000)
+                    return True
+        except Exception:
+            continue
+    return False
 
 
-def fill_like_human(page, email: str, password: str):
-    actions = []
+def click_text_any(page, texts: List[str], exact: bool = True, timeout: int = 2500) -> Tuple[bool, str]:
+    for t in texts:
+        try:
+            loc = page.get_by_text(t, exact=exact)
+            count = loc.count()
+            if count > 0:
+                # 通常後面的按鈕比較接近內容區
+                loc.last.click(timeout=timeout)
+                return True, f"clicked text: {t}"
+        except Exception:
+            continue
+    return False, "not clicked"
 
-    email_candidates = [
-        "input[placeholder*='Email']",
-        "input[placeholder*='email']",
+
+def goto_with_retry(page, url: str, timeout_ms: int = 120000):
+    for i in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception:
+            if i == 1:
+                raise
+            page.wait_for_timeout(3000)
+
+
+def login_email_password(page, login_url: str, email: str, password: str, login_wait_sec: int) -> str:
+    """
+    使用 Email + 密碼登入。
+    如果本來就已登入，會直接略過。
+    """
+    goto_with_retry(page, login_url)
+    page.wait_for_timeout(2500)
+    click_cookie_if_any(page)
+
+    initial_text = page.locator("body").inner_text(timeout=15000)
+    if not text_contains_login_fields(initial_text):
+        return "頁面看起來已經不是登入頁，略過登入。"
+
+    email_selectors = [
         "input[type='email']",
-        "input:not([type])",
-        "input[type='text']",
+        "input[name*='email' i]",
+        "input[placeholder*='Email' i]",
+        "input[placeholder*='email' i]",
+        "input[autocomplete='username']",
+        "input:not([type='password'])",
+    ]
+    pass_selectors = [
+        "input[type='password']",
+        "input[name*='password' i]",
+        "input[placeholder*='密碼']",
+        "input[placeholder*='Password' i]",
+        "input[autocomplete='current-password']",
     ]
 
-    email_filled = False
-    for selector in email_candidates:
+    email_ok = fill_first_visible(page, email_selectors, email)
+    pass_ok = fill_first_visible(page, pass_selectors, password)
+
+    if not email_ok or not pass_ok:
+        return f"沒有成功找到 Email/密碼輸入框。email_ok={email_ok}, pass_ok={pass_ok}"
+
+    ok, msg = click_text_any(page, ["登入", "Sign in", "Login", "Log in"], exact=True, timeout=4000)
+    if not ok:
+        # 最後手段：按 Enter
         try:
-            loc = page.locator(selector).first
+            page.keyboard.press("Enter")
+            msg = "pressed Enter for login"
+        except Exception:
+            msg = "login button not found"
+
+    page.wait_for_timeout(max(3, login_wait_sec) * 1000)
+    click_cookie_if_any(page)
+    return f"Email 密碼登入流程完成：{msg}"
+
+
+def enter_huba_quick_view(page) -> str:
+    """
+    進入虎八速覽。
+    """
+    status = []
+    for text in ["虎八速覽", "我的訂閱", "優分析產業資料庫"]:
+        try:
+            loc = page.get_by_text(text, exact=True)
             if loc.count() > 0:
-                loc.click(timeout=6000)
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                page.keyboard.type(email, delay=55)
-                actions.append(f"typed email by {selector}")
-                email_filled = True
-                break
+                if text == "虎八速覽":
+                    loc.last.click(timeout=3000)
+                    page.wait_for_timeout(2500)
+                    status.append("clicked 虎八速覽")
+                    break
         except Exception:
             pass
 
-    password_filled = False
+    # 如果已經在虎八速覽，不強迫點
+    body = page.locator("body").inner_text(timeout=15000)
+    if "虎八速覽" in body:
+        status.append("頁面包含虎八速覽")
+    return "；".join(status) or "未特別點擊虎八速覽，但繼續執行"
+
+
+def try_click_stock_from_left_list(page, stock_code: str, wait_sec: int) -> Tuple[bool, str]:
+    """
+    若左側清單已存在該股票代號，直接點擊。
+    """
+    attempts = [
+        f"text=/{stock_code}/",
+        f"text={stock_code}",
+    ]
+    for sel in attempts:
+        try:
+            loc = page.locator(sel)
+            count = loc.count()
+            if count > 0:
+                # 避免點到輸入框或文字段落，先點靠前的可見元素
+                for i in range(min(count, 10)):
+                    item = loc.nth(i)
+                    try:
+                        if item.is_visible(timeout=500):
+                            item.click(timeout=2500)
+                            page.wait_for_timeout(wait_sec * 1000)
+                            return True, f"clicked stock text/list item containing {stock_code}"
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return False, f"left list did not expose {stock_code}"
+
+
+def set_input_value_by_js(page, selector: str, value: str) -> bool:
+    """
+    使用原生 setter + input/change 事件，對 React/Vue 比直接 fill 更穩。
+    """
     try:
-        loc = page.locator("input[type='password']").first
-        if loc.count() > 0:
-            loc.click(timeout=6000)
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
-            page.keyboard.type(password, delay=65)
-            actions.append("typed password by input[type=password]")
-            password_filled = True
+        return bool(page.evaluate(
+            """
+            ({selector, value}) => {
+              const el = document.querySelector(selector);
+              if (!el) return false;
+              const proto = Object.getPrototypeOf(el);
+              const desc = Object.getOwnPropertyDescriptor(proto, "value");
+              if (desc && desc.set) desc.set.call(el, value);
+              else el.value = value;
+              el.dispatchEvent(new Event("input", {bubbles:true}));
+              el.dispatchEvent(new Event("change", {bubbles:true}));
+              return true;
+            }
+            """,
+            {"selector": selector, "value": value}
+        ))
     except Exception:
-        pass
+        return False
+
+
+def switch_stock_by_editor(page, stock_code: str, after_click_wait_sec: int) -> Tuple[bool, str]:
+    """
+    主要修正版：
+    1. 先按「編輯」
+    2. 只把股票代號欄位改成純數字 stock_code
+    3. 按 Enter / 儲存 / 確認 / 搜尋
+    4. 檢查頁面股票代號是否真的切換成功
+    """
+    logs = []
+
+    # 先接受 cookie，不然可能擋住點擊
+    click_cookie_if_any(page)
+
+    # 先嘗試從左側清單點，如果使用者的清單已有該股票，這最穩
+    ok, msg = try_click_stock_from_left_list(page, stock_code, after_click_wait_sec)
+    logs.append(msg)
+    body = page.locator("body").inner_text(timeout=20000)
+    current_code, current_name = detect_current_stock(body)
+    if ok and current_code == stock_code:
+        return True, "；".join(logs + [f"切換成功：{current_code} {current_name}".strip()])
+
+    # 點編輯
+    ok, msg = click_text_any(page, ["編輯"], exact=True, timeout=4000)
+    logs.append(msg)
+    page.wait_for_timeout(1500)
+
+    # 以 JS 尋找「股票代碼」附近的 input，只塞 stock_code
+    js_result = page.evaluate(
+        """
+        (stockCode) => {
+          function setNativeValue(el, value) {
+            const proto = Object.getPrototypeOf(el);
+            const desc = Object.getOwnPropertyDescriptor(proto, "value");
+            if (desc && desc.set) desc.set.call(el, value);
+            else el.value = value;
+            el.dispatchEvent(new Event("input", {bubbles:true}));
+            el.dispatchEvent(new Event("change", {bubbles:true}));
+          }
+
+          const inputs = Array.from(document.querySelectorAll("input, textarea"));
+          const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+          };
+
+          let candidates = [];
+
+          for (const el of inputs) {
+            if (!visible(el)) continue;
+            const val = (el.value || "").trim();
+            const ph = (el.getAttribute("placeholder") || "").trim();
+            const aria = (el.getAttribute("aria-label") || "").trim();
+            const parentText = (el.closest("div")?.innerText || "").slice(0, 300);
+            const html = (el.outerHTML || "").slice(0, 400);
+
+            let score = 0;
+            if (/股票代碼|股票代号|代碼|代号|stock/i.test(parentText + ph + aria + html)) score += 10;
+            if (/^\\d{4,6}$/.test(val)) score += 8;
+            if (val === "1101") score += 6;
+            if (/請輸入.*股票|股票.*輸入|代碼|代号|stock/i.test(ph)) score += 5;
+            if (el.type === "hidden" || el.disabled || el.readOnly) score -= 20;
+
+            if (score > 0) candidates.push({el, score, val, ph, parentText});
+          }
+
+          candidates.sort((a, b) => b.score - a.score);
+
+          if (candidates.length === 0) {
+            return {ok:false, reason:"no candidate input", candidates:[]};
+          }
+
+          // 只填最高分欄位，避免把股票名稱欄也塞成 3030
+          const target = candidates[0].el;
+          setNativeValue(target, stockCode);
+          target.focus();
+
+          return {
+            ok:true,
+            reason:"filled best candidate",
+            best:{
+              score:candidates[0].score,
+              oldValue:candidates[0].val,
+              placeholder:candidates[0].ph,
+              parentText:candidates[0].parentText
+            },
+            candidateCount:candidates.length
+          };
+        }
+        """,
+        stock_code
+    )
+    logs.append(f"JS 填入股票代號結果：{js_result}")
+
+    page.wait_for_timeout(800)
+
+    # 按 Enter，常見 SPA 會觸發查詢或保存
+    try:
+        page.keyboard.press("Enter")
+        logs.append("pressed Enter after filling stock code")
+    except Exception as e:
+        logs.append(f"press Enter failed: {e}")
 
     page.wait_for_timeout(1500)
 
-    return {
-        "email_filled": email_filled,
-        "password_filled": password_filled,
-        "actions": actions,
-    }
-
-
-def click_login(page):
-    methods = []
-
-    try:
-        buttons = page.locator("button").filter(has_text="登入")
-        if buttons.count() > 0:
-            buttons.last.click(timeout=6000)
-            methods.append("clicked button has_text 登入")
-            return methods
-    except Exception:
-        pass
-
-    try:
-        clicked = page.evaluate(
-            """
-            () => {
-                function visible(el) {
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    return r.width > 5 &&
-                           r.height > 5 &&
-                           s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           s.opacity !== '0';
-                }
-
-                const nodes = Array.from(document.querySelectorAll('button, div, span, a'))
-                    .filter(visible)
-                    .map(el => ({
-                        el,
-                        text: (el.innerText || '').trim(),
-                        top: el.getBoundingClientRect().top,
-                    }))
-                    .filter(x =>
-                        (x.text === '登入' || x.text === '登 入') &&
-                        !x.text.includes('Google') &&
-                        !x.text.includes('Facebook') &&
-                        !x.text.includes('Apple')
-                    )
-                    .sort((a, b) => a.top - b.top);
-
-                if (!nodes.length) return false;
-
-                nodes[nodes.length - 1].el.scrollIntoView({block: 'center'});
-                nodes[nodes.length - 1].el.click();
-                return true;
-            }
-            """
-        )
-        if clicked:
-            methods.append("JS clicked native login")
-            return methods
-    except Exception:
-        pass
-
-    try:
-        page.locator("input[type='password']").first.click(timeout=6000)
-        page.keyboard.press("Enter")
-        methods.append("pressed Enter in password field")
-        return methods
-    except Exception:
-        pass
-
-    return methods
-
-
-def click_huba_quick_view(page):
-    actions = []
-    page.wait_for_timeout(3000)
-
-    try:
-        if page.get_by_text("虎八速覽", exact=False).count() > 0:
-            page.get_by_text("虎八速覽", exact=False).first.click(timeout=6000)
-            actions.append("clicked text 虎八速覽")
-            page.wait_for_timeout(9000)
-            return actions
-    except Exception:
-        pass
-
-    try:
-        clicked = page.evaluate(
-            """
-            () => {
-                function visible(el) {
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    return r.width > 5 &&
-                           r.height > 5 &&
-                           s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           s.opacity !== '0';
-                }
-
-                const nodes = Array.from(document.querySelectorAll('button, a, div, span, li'))
-                    .filter(visible)
-                    .map(el => ({
-                        el,
-                        text: (el.innerText || '').trim(),
-                        top: el.getBoundingClientRect().top,
-                        left: el.getBoundingClientRect().left,
-                        len: ((el.innerText || '').trim()).length
-                    }))
-                    .filter(x => x.text.includes('虎八速覽'))
-                    .sort((a, b) => a.len - b.len || a.left - b.left || a.top - b.top);
-
-                if (!nodes.length) return false;
-
-                nodes[0].el.scrollIntoView({block: 'center'});
-                nodes[0].el.click();
-                return true;
-            }
-            """
-        )
-        if clicked:
-            actions.append("JS clicked visible 虎八速覽")
-            page.wait_for_timeout(9000)
-            return actions
-    except Exception:
-        pass
-
-    actions.append("failed to click 虎八速覽")
-    return actions
-
-
-def switch_stock(page, stock_code: str, company_name: str):
-    actions = []
-    query = (stock_code or company_name or "").strip()
-
-    if not query:
-        actions.append("no stock query")
-        return actions
-
-    page.wait_for_timeout(3000)
-
-    # Make sure we are near the top where the stock search field is located.
-    try:
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(1000)
-    except Exception:
-        pass
-
-    search_selectors = [
-        "input[placeholder*='搜尋代碼或名稱']",
-        "input[placeholder*='搜尋代碼']",
-        "input[placeholder*='搜尋']",
-        "input[placeholder*='代碼']",
-        "input[placeholder*='名稱']",
-        "input[role='combobox']",
-    ]
-
-    used_selector = ""
-
-    for selector in search_selectors:
+    # 嘗試點會觸發切換的按鈕
+    for button_texts in [
+        ["儲存", "保存", "確認", "確定"],
+        ["查詢", "搜尋", "送出", "套用"],
+        ["編輯"],
+    ]:
+        ok, msg = click_text_any(page, button_texts, exact=True, timeout=2500)
+        logs.append(msg)
+        page.wait_for_timeout(1200)
+        # 有些頁面點第二次編輯才會儲存，先檢查一次
         try:
-            loc = page.locator(selector).first
+            body = page.locator("body").inner_text(timeout=15000)
+            current_code, current_name = detect_current_stock(body)
+            logs.append(f"目前偵測股票：{current_code} {current_name}".strip())
+            if current_code == stock_code:
+                page.wait_for_timeout(after_click_wait_sec * 1000)
+                return True, "；".join(logs)
+        except Exception:
+            pass
+
+    # 最後再等久一點，給後端更新
+    page.wait_for_timeout(after_click_wait_sec * 1000)
+    body = page.locator("body").inner_text(timeout=20000)
+    current_code, current_name = detect_current_stock(body)
+    logs.append(f"最後偵測股票：{current_code} {current_name}".strip())
+
+    return current_code == stock_code, "；".join(logs)
+
+
+def click_topic(page, topic: str, wait_sec: int) -> str:
+    """
+    點選產業情報小助理欄位。
+    """
+    click_cookie_if_any(page)
+
+    # 產品線分析實際頁面可能有 ❤️產品線分析
+    topic_variants = [topic]
+    if topic == "產品線分析":
+        topic_variants = ["產品線分析", "❤️產品線分析"]
+
+    # 先 exact text
+    for t in topic_variants:
+        try:
+            loc = page.get_by_text(t, exact=True)
             if loc.count() > 0:
-                loc.click(timeout=6000)
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                page.keyboard.type(query, delay=80)
-                used_selector = selector
-                actions.append(f"typed stock query {query} by {selector}")
-                page.wait_for_timeout(2500)
-                break
+                loc.last.click(timeout=5000)
+                page.wait_for_timeout(wait_sec * 1000)
+                return f"clicked exact topic: {t}"
         except Exception:
             pass
 
-    if not used_selector:
-        # Fallback: click by coordinates near top-right search box based on screenshot.
-        try:
-            page.mouse.click(1060, 110)
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
-            page.keyboard.type(query, delay=80)
-            actions.append(f"typed stock query {query} by coordinate fallback")
-            page.wait_for_timeout(2500)
-            used_selector = "coordinate"
-        except Exception:
-            actions.append("failed to find search input")
-            return actions
+    # 再 JS 找可點擊文字
+    escaped = topic.replace("\\", "\\\\").replace("'", "\\'")
+    js_clicked = page.evaluate(
+        f"""
+        () => {{
+          const target = '{escaped}';
+          const els = Array.from(document.querySelectorAll('button, div, span, a, li'));
+          const visible = (el) => {{
+            const r = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          }};
+          for (const el of els) {{
+            const txt = (el.innerText || el.textContent || '').trim();
+            if (visible(el) && txt.includes(target)) {{
+              el.click();
+              return txt;
+            }}
+          }}
+          return '';
+        }}
+        """
+    )
+    if js_clicked:
+        page.wait_for_timeout(wait_sec * 1000)
+        return f"JS clicked topic: {js_clicked}"
 
-    # Try clicking search result first.
-    candidate_texts = []
-    if stock_code and company_name:
-        candidate_texts += [f"{stock_code} {company_name}", f"{stock_code}_{company_name}"]
-    if stock_code:
-        candidate_texts.append(stock_code)
-    if company_name:
-        candidate_texts.append(company_name)
-
-    clicked_result = False
-    for text in candidate_texts:
-        try:
-            if text and page.get_by_text(text, exact=False).count() > 0:
-                page.get_by_text(text, exact=False).first.click(timeout=5000)
-                actions.append(f"clicked visible search result: {text}")
-                clicked_result = True
-                page.wait_for_timeout(8000)
-                break
-        except Exception:
-            pass
-
-    if not clicked_result:
-        try:
-            page.keyboard.press("ArrowDown")
-            page.wait_for_timeout(800)
-            page.keyboard.press("Enter")
-            actions.append("pressed ArrowDown + Enter")
-            page.wait_for_timeout(8000)
-        except Exception:
-            pass
-
-    return actions
+    # 找不到就回報，不中斷整個流程
+    return f"topic not found: {topic}"
 
 
-def click_topic(page, topic: str):
-    actions = []
+def extract_topic_content(page, topic: str) -> str:
+    """
+    從整頁文字中盡量切出該 topic 的正文。
+    重點：避免把左側清單、EPS 圖表、Cookie 聲明全部重複塞進每個欄位。
+    """
+    text = page.locator("body").inner_text(timeout=30000)
+    text = strip_repeated_noise(text)
 
-    try:
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(1000)
-    except Exception:
-        pass
+    # 找 Q: topic。產品線分析可能是 Q: ❤️產品線分析
+    q_candidates = [f"Q: {topic}"]
+    if topic == "產品線分析":
+        q_candidates.append("Q: ❤️產品線分析")
 
-    try:
-        if page.get_by_text(topic, exact=True).count() > 0:
-            page.get_by_text(topic, exact=True).last.click(timeout=6000)
-            actions.append(f"clicked exact topic: {topic}")
-            page.wait_for_timeout(2500)
-            return actions
-    except Exception:
-        pass
+    start = -1
+    for q in q_candidates:
+        idx = text.find(q)
+        if idx >= 0:
+            start = idx
+            break
 
-    try:
-        clicked = page.evaluate(
-            """
-            (topic) => {
-                function visible(el) {
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    return r.width > 5 &&
-                           r.height > 5 &&
-                           s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           s.opacity !== '0';
-                }
+    if start < 0:
+        # 後備：找 topic 本身最後一次出現後的內容
+        idx = text.rfind(topic)
+        if idx >= 0:
+            start = idx
 
-                const nodes = Array.from(document.querySelectorAll('button, a, div, span, li'))
-                    .filter(visible)
-                    .map(el => ({
-                        el,
-                        text: (el.innerText || '').trim(),
-                        top: el.getBoundingClientRect().top,
-                        left: el.getBoundingClientRect().left,
-                        len: ((el.innerText || '').trim()).length
-                    }))
-                    .filter(x => x.text === topic || x.text.includes(topic))
-                    .sort((a, b) => a.len - b.len || a.left - b.left || a.top - b.top);
+    if start >= 0:
+        content = text[start:].strip()
+    else:
+        content = text.strip()
 
-                if (!nodes.length) return false;
-
-                nodes[0].el.scrollIntoView({block: 'center'});
-                nodes[0].el.click();
-                return true;
-            }
-            """,
-            topic,
-        )
-        if clicked:
-            actions.append(f"JS clicked topic: {topic}")
-            page.wait_for_timeout(2500)
-            return actions
-    except Exception:
-        pass
-
-    actions.append(f"failed to click topic: {topic}")
-    return actions
-
-
-def build_topic_markdown(company_label: str, topic_item: dict) -> str:
-    return "\n".join([
-        f"# {topic_item['topic']}",
-        "",
-        f"- 公司：{company_label}",
-        f"- 擷取時間：{human_now()}",
-        f"- 頁面標題：{topic_item.get('title', '')}",
-        f"- 頁面網址：{topic_item.get('url', '')}",
-        f"- 點擊狀態：{', '.join(topic_item.get('actions', []))}",
-        "",
-        "---",
-        "",
-        topic_item.get("text", "") or "無內容",
-        "",
-    ])
-
-
-def build_all_markdown(company_label: str, topic_results: list, final_title: str, final_url: str) -> str:
-    parts = [
-        "# UAnalyze 產業情報小助理爬蟲結果",
-        "",
-        f"- 公司：{company_label}",
-        f"- 擷取時間：{human_now()}",
-        f"- 最後頁面標題：{final_title}",
-        f"- 最後頁面網址：{final_url}",
-        "",
-        "---",
-        "",
+    # 砍掉後面的共通財務圖表 / 聲明 / Cookie
+    end_markers = [
+        "\nEPS法人預估",
+        "\n關注熱度提示",
+        "\n優分析 UAnalyze 特別聲明",
+        "\n服務條款|免責聲明",
+        "\n本網站使用 Cookie 技術",
     ]
+    end_positions = [content.find(m) for m in end_markers if content.find(m) > 0]
+    if end_positions:
+        content = content[:min(end_positions)].strip()
 
-    for item in topic_results:
-        parts.append(f"## {item['topic']}")
-        parts.append("")
-        parts.append(f"- 點擊狀態：{', '.join(item.get('actions', []))}")
-        parts.append(f"- 頁面網址：{item.get('url', '')}")
-        parts.append("")
-        parts.append(item.get("text", "") or "無內容")
-        parts.append("")
-        parts.append("---")
-        parts.append("")
-
-    return "\n".join(parts)
+    # 移除 Q: 行之前若仍有導航殘留
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return content
 
 
-def write_run_files(run_dir: Path, company_label: str, topic_results: list, final_title: str, final_url: str, debug: dict):
-    run_dir.mkdir(parents=True, exist_ok=True)
+def crawl_uanalyze(
+    email: str,
+    password: str,
+    stock_code_raw: str,
+    topics: List[str],
+    login_url: str,
+    dashboard_url: str,
+    login_wait_sec: int,
+    after_stock_wait_sec: int,
+    topic_wait_sec: int,
+    save_screenshots: bool,
+    allow_wrong_stock_continue: bool,
+) -> Tuple[str, Dict[str, bytes], Dict[str, str]]:
+    if sync_playwright is None:
+        raise RuntimeError("Playwright 沒有成功安裝。請確認 requirements.txt。")
 
-    all_md = build_all_markdown(company_label, topic_results, final_title, final_url)
-    (run_dir / "_ALL_CONTENT.md").write_text(all_md, encoding="utf-8")
-    (run_dir / "debug_info.json").write_text(json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8")
+    stock_code = normalize_stock_code(stock_code_raw)
+    if not re.fullmatch(r"\d{4,6}", stock_code):
+        raise ValueError("股票代號只需要輸入數字，例如 3030。不要輸入中文或底線。")
 
-    for item in topic_results:
-        topic_md = build_topic_markdown(company_label, item)
-        (run_dir / f"{safe_name(item['topic'])}.md").write_text(topic_md, encoding="utf-8")
+    files: Dict[str, bytes] = {}
+    diagnostics: Dict[str, str] = {}
 
-    return all_md
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1440,1100",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1100},
+            device_scale_factor=1,
+            locale="zh-TW",
+            timezone_id="Asia/Taipei",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        page.set_default_timeout(60000)
+        page.set_default_navigation_timeout(120000)
 
+        login_status = login_email_password(page, login_url, email, password, login_wait_sec)
+        diagnostics["login_status"] = login_status
 
-# -----------------------------
-# Page UI
-# -----------------------------
+        goto_with_retry(page, dashboard_url)
+        page.wait_for_timeout(6000)
+        click_cookie_if_any(page)
+        huba_status = enter_huba_quick_view(page)
+        diagnostics["huba_status"] = huba_status
 
-st.title("UAnalyze 產業情報小助理：長時間爬蟲版")
-st.caption("適合一次爬多個欄位。每完成一個欄位會先寫入暫存資料夾，最後再合併成 Markdown / ZIP。")
+        # 切換股票
+        switch_ok, switch_log = switch_stock_by_editor(page, stock_code, after_stock_wait_sec)
+        diagnostics["switch_stock_log"] = switch_log
 
-with st.expander("登入與爬蟲設定", expanded=True):
-    login_url = st.text_input("UAnalyze 登入頁網址", value="https://pro.uanalyze.com.tw/login-page")
-    email = st.text_input("UAnalyze Email")
-    password = st.text_input("UAnalyze 密碼", type="password")
+        body = page.locator("body").inner_text(timeout=30000)
+        actual_code, actual_name = detect_current_stock(body)
+        diagnostics["actual_stock_code"] = actual_code
+        diagnostics["actual_stock_name"] = actual_name
+        diagnostics["page_title_after_switch"] = page.title()
+        diagnostics["page_url_after_switch"] = page.url
 
-    col1, col2 = st.columns(2)
-    with col1:
-        stock_code = st.text_input("股票代號", value="3030")
-    with col2:
-        company_name = st.text_input("公司名稱", value="德律")
-
-    selected_topics = st.multiselect("選擇要爬的欄位", TOPICS, default=TOPICS)
-
-    col3, col4 = st.columns(2)
-    with col3:
-        wait_seconds = st.slider("登入後等待秒數", 5, 90, 25)
-    with col4:
-        topic_wait_seconds = st.slider("每個欄位點擊後等待秒數", 3, 60, 15)
-
-    save_screenshots = st.checkbox("ZIP 內同時保存每個欄位截圖（較慢，不建議手機長時間爬時開）", value=False)
-    show_intermediate_images = st.checkbox("頁面上顯示登入 / 切換公司截圖（較慢）", value=False)
-
-st.divider()
-
-# Show latest cached runs first, useful after app reconnects.
-latest_runs = latest_run_dirs()
-if latest_runs:
-    with st.expander("最近完成 / 暫存結果", expanded=False):
-        for run_dir in latest_runs:
-            all_md_path = run_dir / "_ALL_CONTENT.md"
-            if all_md_path.exists():
-                all_md = all_md_path.read_text(encoding="utf-8")
-                st.write(f"結果資料夾：`{run_dir.name}`")
-                copy_button(all_md, f"一鍵複製 {run_dir.name}")
-                st.download_button(
-                    label=f"下載 ZIP：{run_dir.name}",
-                    data=build_zip_bytes(run_dir),
-                    file_name=f"{run_dir.name}.zip",
-                    mime="application/zip",
-                    key=f"zip_{run_dir.name}",
-                )
-
-
-if st.button("開始長時間爬取產業情報欄位"):
-    if not email or not password:
-        st.error("請先輸入 Email 和密碼。")
-        st.stop()
-    if not stock_code and not company_name:
-        st.error("請先輸入股票代號或公司名稱。")
-        st.stop()
-    if not selected_topics:
-        st.error("請至少選一個要爬的欄位。")
-        st.stop()
-
-    company_label = f"{stock_code}_{company_name}".strip("_")
-    run_id = f"{now_stamp()}_{safe_name(company_label)}"
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    st.info("開始檢查 Playwright Chromium。第一次部署後可能需要 1～3 分鐘，之後會快很多。")
-
-    install = ensure_playwright_chromium()
-    if install["returncode"] != 0:
-        st.error("Playwright Chromium 安裝失敗。")
-        st.code(install["stdout"] + "\n" + install["stderr"])
-        st.stop()
-
-    st.success("Playwright Chromium 安裝 / 檢查完成。")
-
-    progress = st.progress(0)
-    status_box = st.empty()
-    log_box = st.empty()
-    logs = []
-
-    def log(msg: str):
-        line = f"[{human_now()}] {msg}"
-        logs.append(line)
-        log_box.text("\n".join(logs[-12:]))
-        try:
-            (run_dir / "run_log.txt").write_text("\n".join(logs), encoding="utf-8")
-        except Exception:
-            pass
-
-    try:
-        from playwright.sync_api import sync_playwright
-
-        topic_results = []
-        screenshots_dir = run_dir / "screenshots"
         if save_screenshots:
-            screenshots_dir.mkdir(exist_ok=True)
+            png = page.screenshot(full_page=True)
+            files[f"screenshots/{stock_code}_after_stock_switch.png"] = png
 
-        debug = {
-            "run_id": run_id,
-            "company_label": company_label,
-            "selected_topics": selected_topics,
-            "started_at": human_now(),
-        }
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
+        if actual_code != stock_code:
+            warning = (
+                f"⚠️ 股票切換失敗：目標是 {stock_code}，但頁面實際偵測為 {actual_code or '未知'} {actual_name or ''}。\n\n"
+                f"為避免把台泥 1101 誤標成 {stock_code}，本次已停止爬取。\n\n"
+                f"切換紀錄：\n{switch_log}"
             )
+            if not allow_wrong_stock_continue:
+                md = f"# UAnalyze 爬蟲停止\n\n{warning}\n"
+                files[f"{stock_code}_switch_failed.md"] = md.encode("utf-8")
+                browser.close()
+                return md, files, diagnostics
 
-            context = browser.new_context(
-                viewport={"width": 1440, "height": 1000},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
+        page_title = page.title()
+        page_url = page.url
+        company = actual_name or ""
 
-            page = context.new_page()
-            page.set_default_timeout(60000)
-            page.set_default_navigation_timeout(90000)
+        sections = []
+        for topic in topics:
+            status = click_topic(page, topic, topic_wait_sec)
+            content = extract_topic_content(page, topic)
 
-            log("登入 UAnalyze 中")
-            status_box.write("登入 UAnalyze 中...")
-            page.goto(login_url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(7000)
-
-            blocker_actions = close_blockers(page)
-            fill_result = fill_like_human(page, email, password)
-            login_methods = click_login(page)
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=25000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(wait_seconds * 1000)
-
-            login_title = page.title()
-            login_url_after = page.url
-            login_text = extract_body_text(page)
-            debug.update({
-                "blocker_actions": blocker_actions,
-                "fill_result": fill_result,
-                "login_methods": login_methods,
-                "login_title": login_title,
-                "login_url_after": login_url_after,
-            })
-            (run_dir / "debug_login_text.txt").write_text(login_text, encoding="utf-8")
-            progress.progress(10)
-            log(f"登入後：{login_title} / {login_url_after}")
-
-            if show_intermediate_images:
-                st.image(page.screenshot(full_page=True), caption="登入後截圖")
-
-            log("開啟虎八速覽")
-            status_box.write("開啟虎八速覽中...")
-            huba_actions = click_huba_quick_view(page)
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=25000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(7000)
-
-            huba_title = page.title()
-            huba_url = page.url
-            huba_text = extract_body_text(page)
-            debug.update({
-                "huba_actions": huba_actions,
-                "huba_title": huba_title,
-                "huba_url": huba_url,
-            })
-            (run_dir / "debug_huba_text.txt").write_text(huba_text, encoding="utf-8")
-            progress.progress(20)
-            log(f"虎八速覽：{huba_title} / {huba_url}")
-
-            log(f"切換公司：{company_label}")
-            status_box.write(f"切換公司：{company_label} ...")
-            stock_actions = switch_stock(page, stock_code, company_name)
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=25000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(8000)
-
-            after_stock_title = page.title()
-            after_stock_url = page.url
-            after_stock_text = extract_body_text(page)
-            debug.update({
-                "stock_actions": stock_actions,
-                "after_stock_title": after_stock_title,
-                "after_stock_url": after_stock_url,
-            })
-            (run_dir / "debug_after_stock_text.txt").write_text(after_stock_text, encoding="utf-8")
-            try:
-                after_stock_screenshot = page.screenshot(full_page=True)
-                (run_dir / "after_stock_screenshot.png").write_bytes(after_stock_screenshot)
-                if show_intermediate_images:
-                    st.image(after_stock_screenshot, caption="切換公司後截圖")
-            except Exception:
-                pass
-
-            progress.progress(30)
-            log(f"切換公司後：{after_stock_title} / {after_stock_url}")
-
-            total = len(selected_topics)
-
-            for idx, topic in enumerate(selected_topics, start=1):
-                status_box.write(f"處理欄位 {idx}/{total}：{topic}")
-                log(f"處理欄位 {idx}/{total}：{topic}")
-
-                actions = click_topic(page, topic)
-
+            if save_screenshots:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=25000)
+                    png = page.screenshot(full_page=True)
+                    files[f"screenshots/{stock_code}_{safe_filename(topic)}.png"] = png
                 except Exception:
                     pass
 
-                page.wait_for_timeout(topic_wait_seconds * 1000)
-
-                topic_text = extract_body_text(page)
-                topic_item = {
-                    "topic": topic,
-                    "actions": actions,
-                    "text": topic_text,
-                    "url": page.url,
-                    "title": page.title(),
-                    "captured_at": human_now(),
-                }
-                topic_results.append(topic_item)
-
-                topic_md = build_topic_markdown(company_label, topic_item)
-                (run_dir / f"{safe_name(topic)}.md").write_text(topic_md, encoding="utf-8")
-
-                if save_screenshots:
-                    try:
-                        (screenshots_dir / f"{safe_name(topic)}.png").write_bytes(page.screenshot(full_page=True))
-                    except Exception:
-                        pass
-
-                # Save partial all-content after each topic.
-                write_run_files(run_dir, company_label, topic_results, page.title(), page.url, debug)
-
-                progress_value = 30 + int(idx / total * 65)
-                progress.progress(min(progress_value, 95))
-                log(f"完成欄位：{topic}")
-
-            final_title = page.title()
-            final_url = page.url
-            browser.close()
-
-        debug["finished_at"] = human_now()
-        result_markdown = write_run_files(run_dir, company_label, topic_results, final_title, final_url, debug)
-
-        progress.progress(100)
-        status_box.write("完成。")
-        log("全部完成")
-
-        st.success("爬取完成。")
-
-        company_success_hint = (
-            (stock_code and stock_code in (run_dir / "debug_after_stock_text.txt").read_text(encoding="utf-8"))
-            or (company_name and company_name in (run_dir / "debug_after_stock_text.txt").read_text(encoding="utf-8"))
-        )
-        if company_success_hint:
-            st.success(f"看起來已經切換到 {company_label}。")
-        else:
-            st.warning("不確定是否成功切換公司。請下載 ZIP 查看 after_stock_screenshot.png；若仍是台泥，需要再調整搜尋欄位定位。")
-
-        st.subheader("全部爬蟲結果")
-        copy_button(result_markdown, "一鍵複製全部爬蟲結果")
-        st.text_area("全部結果 Markdown", result_markdown, height=560)
-
-        st.download_button(
-            label="下載 ZIP",
-            data=build_zip_bytes(run_dir),
-            file_name=f"{run_id}.zip",
-            mime="application/zip",
-        )
-
-        st.download_button(
-            label="下載 Markdown",
-            data=result_markdown.encode("utf-8"),
-            file_name=f"{run_id}.md",
-            mime="text/markdown",
-        )
-
-    except Exception as e:
-        st.error("爬取流程失敗。")
-        st.exception(e)
-        try:
-            (run_dir / "error.txt").write_text(str(e), encoding="utf-8")
-        except Exception:
-            pass
-        if run_dir.exists() and any(run_dir.iterdir()):
-            st.download_button(
-                label="下載目前暫存 ZIP",
-                data=build_zip_bytes(run_dir),
-                file_name=f"{run_id}_partial.zip",
-                mime="application/zip",
+            sections.append(
+                f"## {topic}\n\n"
+                f"- 點擊狀態：{status}\n"
+                f"- 頁面網址：{page.url}\n\n"
+                f"{content}\n"
             )
+
+        crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        md = (
+            f"# UAnalyze 產業情報小助理爬蟲結果\n\n"
+            f"- 股票代號：{stock_code}\n"
+            f"- 頁面實際股票代號：{actual_code or '未偵測'}\n"
+            f"- 頁面實際股票名稱：{company or '未偵測'}\n"
+            f"- 擷取時間：{crawl_time}\n"
+            f"- 最後頁面標題：{page_title}\n"
+            f"- 最後頁面網址：{page_url}\n\n"
+            f"---\n\n"
+            + "\n---\n\n".join(sections)
+        )
+
+        files[f"{stock_code}_{safe_filename(company)}_uanalyze.md"] = md.encode("utf-8")
+        files["diagnostics.json"] = json.dumps(diagnostics, ensure_ascii=False, indent=2).encode("utf-8")
+
+        browser.close()
+        return md, files, diagnostics
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+st.caption("手機版操作：輸入帳密、股票代號、選欄位，按一次開始。股票欄位只要填數字，例如 3030。")
+
+with st.expander("使用說明", expanded=False):
+    st.markdown(
+        """
+        這版重點修正：
+
+        1. 股票欄位只吃數字，`3030_德律` 會自動轉成 `3030`。
+        2. 爬取前會先切換股票，並檢查頁面實際股票代碼。
+        3. 如果切換失敗，預設會停止，避免把 `1101 台泥` 誤存成 `3030 德律`。
+        4. 每個欄位等待時間可以拉長，不用分批爬。
+        5. 產出結果可一鍵複製，也可下載 ZIP。
+        """
+    )
+
+install_msg = ensure_playwright_chromium()
+if "失敗" in install_msg:
+    st.warning(install_msg)
+else:
+    st.success(install_msg)
+
+with st.sidebar:
+    st.header("登入與目標")
+    login_url = st.text_input("登入網址", LOGIN_URL_DEFAULT)
+    dashboard_url = st.text_input("虎八速覽網址", DASHBOARD_URL_DEFAULT)
+
+    email = st.text_input("UAnalyze Email")
+    password = st.text_input("UAnalyze 密碼", type="password")
+
+    stock_code_raw = st.text_input("股票代號（只要數字）", value="3030", help="例如 3030。不要輸入 3030_德律，也不要輸入中文。")
+    stock_code = normalize_stock_code(stock_code_raw)
+    st.caption(f"實際送入爬蟲的股票代號：`{stock_code}`")
+
+    st.header("欄位")
+    topics = st.multiselect("選擇要爬的欄位", DEFAULT_TOPICS, default=DEFAULT_TOPICS)
+
+    st.header("等待時間")
+    login_wait_sec = st.slider("登入後等待秒數", min_value=5, max_value=90, value=25, step=5)
+    after_stock_wait_sec = st.slider("股票切換後等待秒數", min_value=5, max_value=120, value=35, step=5)
+    topic_wait_sec = st.slider("每個欄位點擊後等待秒數", min_value=5, max_value=90, value=25, step=5)
+
+    st.header("進階")
+    save_screenshots = st.checkbox("ZIP 內保存每個欄位截圖", value=False)
+    allow_wrong_stock_continue = st.checkbox("即使股票切換失敗也繼續爬取（不建議）", value=False)
+
+start = st.button("開始爬取產業情報欄位", type="primary", use_container_width=True)
+
+if start:
+    if not email or not password:
+        st.error("請先輸入 UAnalyze Email 和密碼。")
+    elif not topics:
+        st.error("請至少選一個欄位。")
+    elif not re.fullmatch(r"\d{4,6}", stock_code):
+        st.error("股票代號只需要輸入數字，例如 3030。")
+    else:
+        with st.spinner("正在登入、切換股票、逐欄位爬取。這版等待時間較長，請不要關閉頁面。"):
+            try:
+                md, files, diagnostics = crawl_uanalyze(
+                    email=email,
+                    password=password,
+                    stock_code_raw=stock_code_raw,
+                    topics=topics,
+                    login_url=login_url,
+                    dashboard_url=dashboard_url,
+                    login_wait_sec=login_wait_sec,
+                    after_stock_wait_sec=after_stock_wait_sec,
+                    topic_wait_sec=topic_wait_sec,
+                    save_screenshots=save_screenshots,
+                    allow_wrong_stock_continue=allow_wrong_stock_continue,
+                )
+                st.session_state["last_md"] = md
+                st.session_state["last_files"] = files
+                st.session_state["last_diagnostics"] = diagnostics
+            except Exception as e:
+                st.exception(e)
+
+if "last_md" in st.session_state:
+    md = st.session_state["last_md"]
+    files = st.session_state.get("last_files", {})
+    diagnostics = st.session_state.get("last_diagnostics", {})
+
+    actual = diagnostics.get("actual_stock_code", "")
+    target = normalize_stock_code(stock_code_raw)
+
+    if actual and actual == target:
+        st.success(f"看起來已成功切換並爬取：{actual} {diagnostics.get('actual_stock_name','')}")
+    elif "爬蟲停止" in md:
+        st.error("股票切換未成功，已停止避免抓錯公司。")
+    else:
+        st.warning(f"請確認實際股票代碼：{actual or '未偵測'}，目標：{target}")
+
+    make_copy_button(md)
+
+    st.subheader("爬蟲結果")
+    st.text_area("page text", md, height=520)
+
+    zip_bytes = make_zip_bytes(files)
+    zip_name = f"uanalyze_{normalize_stock_code(stock_code_raw)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    st.download_button(
+        "下載爬蟲結果 ZIP",
+        data=zip_bytes,
+        file_name=zip_name,
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    with st.expander("診斷紀錄", expanded=False):
+        st.json(diagnostics)
