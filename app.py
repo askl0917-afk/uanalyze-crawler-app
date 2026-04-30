@@ -5,6 +5,7 @@ import json
 import time
 import zipfile
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -12,11 +13,35 @@ from typing import Dict, List, Tuple, Optional
 import streamlit as st
 import streamlit.components.v1 as components
 
+
+def _install_python_package(package: str) -> str:
+    """
+    Streamlit Cloud 正常應該會讀 requirements.txt。
+    但如果 GitHub 上檔名變成 requirements 或部署快取沒吃到，
+    這裡做一個保險：App 啟動時自動補裝。
+    """
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return str(e)
+
+
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 except Exception:
-    sync_playwright = None
-    PlaywrightTimeoutError = Exception
+    import sys
+    _pip_log = _install_python_package("playwright")
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except Exception:
+        sync_playwright = None
+        PlaywrightTimeoutError = Exception
 
 
 APP_TITLE = "UAnalyze 產業情報小助理爬蟲"
@@ -91,7 +116,7 @@ def ensure_playwright_chromium() -> str:
         return "Playwright Chromium 已準備完成。"
 
     if sync_playwright is None:
-        return "Playwright 尚未安裝，請確認 requirements.txt 有 playwright。"
+        return "Playwright 尚未安裝，且自動補裝失敗。請確認 GitHub 上有 requirements.txt，內容包含 playwright。"
 
     # 安裝 chromium。若已安裝，這行通常很快。
     code, out = run_cmd(["python", "-m", "playwright", "install", "chromium"], timeout=240)

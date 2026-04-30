@@ -32,3 +32,12 @@
 ## 注意
 
 如果切換股票失敗，App 會停止，這是刻意設計，避免把錯的公司資料存成目標公司。
+
+
+## v3 修正
+
+如果 Streamlit Cloud 沒有正確讀到 requirements.txt，畫面會出現：
+`No module named playwright`
+
+本版在 app.py 內加入保險機制，啟動時會自動補裝 playwright。
+但 GitHub 根目錄仍建議保留正確檔名：`requirements.txt`。
