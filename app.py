@@ -1,16 +1,18 @@
 import io
+import json
 import zipfile
 import subprocess
 import sys
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
-st.set_page_config(page_title="UAnalyze 虎八速覽測試", layout="wide")
+st.set_page_config(page_title="UAnalyze 虎八速覽爬蟲", layout="wide")
 
-st.title("UAnalyze 虎八速覽開啟測試版")
-st.caption("登入後自動點擊左側選單的「虎八速覽」，確認雲端瀏覽器能不能進入該頁。密碼不會寫入 ZIP。")
+st.title("UAnalyze 虎八速覽爬蟲版")
+st.caption("登入後自動開啟虎八速覽，抓取目前頁面文字，並提供一鍵複製與 ZIP 下載。密碼不會寫入檔案。")
 
 login_url = st.text_input(
     "UAnalyze 登入頁網址",
@@ -21,6 +23,71 @@ email = st.text_input("UAnalyze Email")
 password = st.text_input("UAnalyze 密碼", type="password")
 
 wait_seconds = st.slider("登入後等待秒數", 5, 45, 15)
+
+
+def copy_button(text: str, label: str = "一鍵複製全部資料"):
+    safe_text = json.dumps(text or "", ensure_ascii=False)
+    safe_label = json.dumps(label, ensure_ascii=False)
+
+    components.html(
+        f"""
+        <div style="margin: 12px 0;">
+            <button
+                onclick="copyTextToClipboard()"
+                style="
+                    background-color:#ff9800;
+                    color:#111;
+                    border:none;
+                    border-radius:10px;
+                    padding:14px 18px;
+                    font-size:18px;
+                    font-weight:700;
+                    cursor:pointer;
+                    width:100%;
+                    max-width:420px;
+                "
+            >
+                📋 {label}
+            </button>
+            <div id="copy-status" style="margin-top:10px;color:#20c997;font-size:16px;"></div>
+        </div>
+
+        <script>
+        const textToCopy = {safe_text};
+
+        async function copyTextToClipboard() {{
+            const status = document.getElementById("copy-status");
+
+            try {{
+                await navigator.clipboard.writeText(textToCopy);
+                status.innerText = "已複製到剪貼簿";
+            }} catch (err) {{
+                const textarea = document.createElement("textarea");
+                textarea.value = textToCopy;
+                textarea.style.position = "fixed";
+                textarea.style.left = "0";
+                textarea.style.top = "0";
+                textarea.style.width = "1px";
+                textarea.style.height = "1px";
+                textarea.style.opacity = "0";
+                document.body.appendChild(textarea);
+                textarea.focus();
+                textarea.select();
+
+                try {{
+                    document.execCommand("copy");
+                    status.innerText = "已複製到剪貼簿";
+                }} catch (fallbackErr) {{
+                    status.innerText = "複製失敗，請改用下方文字框手動長按複製";
+                }}
+
+                document.body.removeChild(textarea);
+            }}
+        }}
+        </script>
+        """,
+        height=100,
+    )
 
 
 def install_playwright_chromium():
@@ -187,7 +254,6 @@ def click_huba_quick_view(page):
 
     page.wait_for_timeout(3000)
 
-    # 方法 1：直接點虎八速覽文字
     try:
         if page.get_by_text("虎八速覽", exact=False).count() > 0:
             page.get_by_text("虎八速覽", exact=False).first.click(timeout=5000)
@@ -197,7 +263,6 @@ def click_huba_quick_view(page):
     except Exception:
         pass
 
-    # 方法 2：如果左側選單太窄或被收起，先找漢堡選單
     try:
         hamburger_clicked = page.evaluate(
             """
@@ -233,7 +298,6 @@ def click_huba_quick_view(page):
     except Exception:
         pass
 
-    # 方法 3：再點一次虎八速覽
     try:
         if page.get_by_text("虎八速覽", exact=False).count() > 0:
             page.get_by_text("虎八速覽", exact=False).first.click(timeout=5000)
@@ -243,7 +307,6 @@ def click_huba_quick_view(page):
     except Exception:
         pass
 
-    # 方法 4：JS 掃描可見文字
     try:
         clicked = page.evaluate(
             """
@@ -288,6 +351,21 @@ def click_huba_quick_view(page):
 
     actions.append("failed to click 虎八速覽")
     return actions
+
+
+def build_markdown(title, url, text):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return f"""# UAnalyze 虎八速覽爬蟲結果
+
+- 擷取時間：{now}
+- 頁面標題：{title}
+- 頁面網址：{url}
+
+---
+
+{text}
+"""
 
 
 if st.button("登入並開啟虎八速覽"):
@@ -373,6 +451,8 @@ if st.button("登入並開啟虎八速覽"):
 
             browser.close()
 
+        result_markdown = build_markdown(huba_title, huba_url, huba_text)
+
         st.subheader("登入結果")
         st.write("彈窗 / Cookie 處理動作：", blocker_actions)
         st.write("填表結果：", fill_result)
@@ -391,7 +471,10 @@ if st.button("登入並開啟虎八速覽"):
         st.image(huba_screenshot, caption="虎八速覽頁面截圖")
 
         st.subheader("目前頁面文字")
-        st.text_area("page text", huba_text, height=350)
+
+        copy_button(result_markdown, "一鍵複製虎八速覽全部文字")
+
+        st.text_area("page text", result_markdown, height=400)
 
         success_hint = "虎八速覽" in huba_text or "速覽" in huba_text
 
@@ -401,12 +484,12 @@ if st.button("登入並開啟虎八速覽"):
             st.warning("可能尚未成功進入虎八速覽，請看截圖與頁面文字。")
 
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"uanalyze_huba_quick_view_debug_{now}.zip"
+        zip_name = f"uanalyze_huba_quick_view_{now}.zip"
 
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("login_body_text.txt", login_text)
+            z.writestr("_ALL_CONTENT.md", result_markdown)
             z.writestr("huba_body_text.txt", huba_text)
             z.writestr(
                 "debug_info.txt",
@@ -426,10 +509,17 @@ if st.button("登入並開啟虎八速覽"):
         zip_buffer.seek(0)
 
         st.download_button(
-            label="下載虎八速覽診斷 ZIP",
+            label="下載虎八速覽 ZIP",
             data=zip_buffer,
             file_name=zip_name,
             mime="application/zip",
+        )
+
+        st.download_button(
+            label="下載 Markdown",
+            data=result_markdown.encode("utf-8"),
+            file_name=f"uanalyze_huba_quick_view_{now}.md",
+            mime="text/markdown",
         )
 
     except Exception as e:
