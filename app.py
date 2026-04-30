@@ -7,10 +7,10 @@ from datetime import datetime
 import streamlit as st
 
 
-st.set_page_config(page_title="UAnalyze Email Login Test v2", layout="wide")
+st.set_page_config(page_title="UAnalyze 虎八速覽測試", layout="wide")
 
-st.title("UAnalyze Email 登入診斷版 v2")
-st.caption("這版會用真人鍵盤輸入方式測試 Email / 密碼登入。密碼不會寫入檔案。")
+st.title("UAnalyze 虎八速覽開啟測試版")
+st.caption("登入後自動點擊左側選單的「虎八速覽」，確認雲端瀏覽器能不能進入該頁。密碼不會寫入 ZIP。")
 
 login_url = st.text_input(
     "UAnalyze 登入頁網址",
@@ -20,7 +20,7 @@ login_url = st.text_input(
 email = st.text_input("UAnalyze Email")
 password = st.text_input("UAnalyze 密碼", type="password")
 
-wait_seconds = st.slider("按下登入後等待秒數", 5, 45, 20)
+wait_seconds = st.slider("登入後等待秒數", 5, 45, 15)
 
 
 def install_playwright_chromium():
@@ -30,14 +30,6 @@ def install_playwright_chromium():
         text=True,
         timeout=240,
     )
-
-
-def try_click_text(page, text):
-    try:
-        page.get_by_text(text, exact=False).click(timeout=4000)
-        return True
-    except Exception:
-        return False
 
 
 def close_blockers(page):
@@ -76,7 +68,6 @@ def close_blockers(page):
 def fill_like_human(page, email, password):
     actions = []
 
-    # 找 Email 欄位
     email_candidates = [
         "input[placeholder*='Email']",
         "input[placeholder*='email']",
@@ -101,7 +92,6 @@ def fill_like_human(page, email, password):
         except Exception:
             pass
 
-    # 找密碼欄位
     password_filled = False
 
     try:
@@ -128,7 +118,6 @@ def fill_like_human(page, email, password):
 def click_login(page):
     methods = []
 
-    # 方法 1：找 button 裡面文字剛好是登入
     try:
         buttons = page.locator("button").filter(has_text="登入")
         if buttons.count() > 0:
@@ -138,7 +127,6 @@ def click_login(page):
     except Exception:
         pass
 
-    # 方法 2：找任意可見元素，排除 Google/Facebook/Apple
     try:
         clicked = page.evaluate(
             """
@@ -183,7 +171,6 @@ def click_login(page):
     except Exception:
         pass
 
-    # 方法 3：密碼欄位 Enter
     try:
         page.locator("input[type='password']").first.click(timeout=5000)
         page.keyboard.press("Enter")
@@ -195,7 +182,115 @@ def click_login(page):
     return methods
 
 
-if st.button("測試 Email 登入 v2"):
+def click_huba_quick_view(page):
+    actions = []
+
+    page.wait_for_timeout(3000)
+
+    # 方法 1：直接點虎八速覽文字
+    try:
+        if page.get_by_text("虎八速覽", exact=False).count() > 0:
+            page.get_by_text("虎八速覽", exact=False).first.click(timeout=5000)
+            actions.append("clicked text 虎八速覽")
+            page.wait_for_timeout(8000)
+            return actions
+    except Exception:
+        pass
+
+    # 方法 2：如果左側選單太窄或被收起，先找漢堡選單
+    try:
+        hamburger_clicked = page.evaluate(
+            """
+            () => {
+                function visible(el) {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 5 &&
+                           r.height > 5 &&
+                           s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           s.opacity !== '0';
+                }
+
+                const nodes = Array.from(document.querySelectorAll('button, div, span'))
+                    .filter(visible)
+                    .filter(el => {
+                        const text = (el.innerText || '').trim();
+                        const cls = String(el.className || '').toLowerCase();
+                        return text === '☰' || cls.includes('menu') || cls.includes('hamburger');
+                    });
+
+                if (!nodes.length) return false;
+                nodes[0].click();
+                return true;
+            }
+            """
+        )
+
+        if hamburger_clicked:
+            actions.append("clicked possible menu/hamburger")
+            page.wait_for_timeout(3000)
+    except Exception:
+        pass
+
+    # 方法 3：再點一次虎八速覽
+    try:
+        if page.get_by_text("虎八速覽", exact=False).count() > 0:
+            page.get_by_text("虎八速覽", exact=False).first.click(timeout=5000)
+            actions.append("clicked text 虎八速覽 after menu")
+            page.wait_for_timeout(8000)
+            return actions
+    except Exception:
+        pass
+
+    # 方法 4：JS 掃描可見文字
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+                function visible(el) {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 5 &&
+                           r.height > 5 &&
+                           s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           s.opacity !== '0';
+                }
+
+                const nodes = Array.from(document.querySelectorAll('button, a, div, span, li'))
+                    .filter(visible)
+                    .map(el => ({
+                        el,
+                        text: (el.innerText || '').trim(),
+                        top: el.getBoundingClientRect().top,
+                        left: el.getBoundingClientRect().left,
+                        len: ((el.innerText || '').trim()).length
+                    }))
+                    .filter(x => x.text.includes('虎八速覽'))
+                    .sort((a, b) => a.len - b.len || a.left - b.left || a.top - b.top);
+
+                if (!nodes.length) return false;
+
+                nodes[0].el.scrollIntoView({block: 'center'});
+                nodes[0].el.click();
+                return true;
+            }
+            """
+        )
+
+        if clicked:
+            actions.append("JS clicked visible 虎八速覽")
+            page.wait_for_timeout(8000)
+            return actions
+    except Exception:
+        pass
+
+    actions.append("failed to click 虎八速覽")
+    return actions
+
+
+if st.button("登入並開啟虎八速覽"):
     if not email or not password:
         st.error("請先輸入 Email 和密碼。")
         st.stop()
@@ -240,11 +335,6 @@ if st.button("測試 Email 登入 v2"):
             blocker_actions = close_blockers(page)
             page.wait_for_timeout(3000)
 
-            before_title = page.title()
-            before_url = page.url
-            before_text = page.locator("body").inner_text(timeout=10000)
-            before_screenshot = page.screenshot(full_page=True)
-
             fill_result = fill_like_human(page, email, password)
             filled_screenshot = page.screenshot(full_page=True)
 
@@ -257,82 +347,91 @@ if st.button("測試 Email 登入 v2"):
 
             page.wait_for_timeout(wait_seconds * 1000)
 
-            after_title = page.title()
-            after_url = page.url
+            login_title = page.title()
+            login_url_after = page.url
+            login_text = page.locator("body").inner_text(timeout=10000)
+            login_screenshot = page.screenshot(full_page=True)
+
+            huba_actions = click_huba_quick_view(page)
 
             try:
-                after_text = page.locator("body").inner_text(timeout=10000)
+                page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
-                after_text = ""
+                pass
 
-            after_screenshot = page.screenshot(full_page=True)
+            page.wait_for_timeout(5000)
+
+            huba_title = page.title()
+            huba_url = page.url
+
+            try:
+                huba_text = page.locator("body").inner_text(timeout=10000)
+            except Exception:
+                huba_text = ""
+
+            huba_screenshot = page.screenshot(full_page=True)
 
             browser.close()
 
-        st.subheader("處理結果")
+        st.subheader("登入結果")
         st.write("彈窗 / Cookie 處理動作：", blocker_actions)
         st.write("填表結果：", fill_result)
         st.write("登入點擊方法：", login_methods)
+        st.write("登入後標題：", login_title)
+        st.write("登入後網址：", login_url_after)
 
-        st.subheader("登入前狀態")
-        st.write("登入前標題：", before_title)
-        st.write("登入前網址：", before_url)
-        st.image(before_screenshot, caption="登入前截圖")
+        st.image(filled_screenshot, caption="填入 Email / 密碼後截圖")
+        st.image(login_screenshot, caption="登入後截圖")
 
-        st.subheader("填入 Email / 密碼後截圖")
-        st.image(filled_screenshot, caption="填入後截圖")
+        st.subheader("虎八速覽開啟結果")
+        st.write("虎八速覽點擊動作：", huba_actions)
+        st.write("目前頁面標題：", huba_title)
+        st.write("目前頁面網址：", huba_url)
 
-        st.subheader("點擊登入後狀態")
-        st.write("登入後標題：", after_title)
-        st.write("登入後網址：", after_url)
-        st.image(after_screenshot, caption="登入後截圖")
+        st.image(huba_screenshot, caption="虎八速覽頁面截圖")
 
-        st.subheader("登入後頁面文字")
-        st.text_area("after body text", after_text, height=300)
+        st.subheader("目前頁面文字")
+        st.text_area("page text", huba_text, height=350)
 
-        success_hint = (
-            "login-page" not in after_url
-            and "Google 登入" not in after_text
-            and "Facebook 登入" not in after_text
-            and "Apple 登入" not in after_text
-        )
+        success_hint = "虎八速覽" in huba_text or "速覽" in huba_text
 
         if success_hint:
-            st.success("看起來可能已經登入成功。")
+            st.success("看起來已經成功進入虎八速覽。")
         else:
-            st.warning("看起來仍停在登入頁，這次尚未成功登入。")
+            st.warning("可能尚未成功進入虎八速覽，請看截圖與頁面文字。")
 
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"uanalyze_email_login_v2_debug_{now}.zip"
+        zip_name = f"uanalyze_huba_quick_view_debug_{now}.zip"
 
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("before_body_text.txt", before_text)
-            z.writestr("after_body_text.txt", after_text)
+            z.writestr("login_body_text.txt", login_text)
+            z.writestr("huba_body_text.txt", huba_text)
             z.writestr(
                 "debug_info.txt",
                 f"blocker_actions={blocker_actions}\n"
-                f"before_title={before_title}\n"
-                f"before_url={before_url}\n"
                 f"fill_result={fill_result}\n"
                 f"login_methods={login_methods}\n"
-                f"after_title={after_title}\n"
-                f"after_url={after_url}\n"
+                f"login_title={login_title}\n"
+                f"login_url_after={login_url_after}\n"
+                f"huba_actions={huba_actions}\n"
+                f"huba_title={huba_title}\n"
+                f"huba_url={huba_url}\n"
             )
-            z.writestr("before_screenshot.png", before_screenshot)
             z.writestr("filled_screenshot.png", filled_screenshot)
-            z.writestr("after_screenshot.png", after_screenshot)
+            z.writestr("login_screenshot.png", login_screenshot)
+            z.writestr("huba_screenshot.png", huba_screenshot)
 
         zip_buffer.seek(0)
 
         st.download_button(
-            label="下載 Email 登入 v2 診斷 ZIP",
+            label="下載虎八速覽診斷 ZIP",
             data=zip_buffer,
             file_name=zip_name,
             mime="application/zip",
         )
 
     except Exception as e:
-        st.error("Email 登入 v2 診斷失敗。")
+        st.error("開啟虎八速覽流程失敗。")
         st.exception(e)
