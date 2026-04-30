@@ -7,10 +7,10 @@ from datetime import datetime
 import streamlit as st
 
 
-st.set_page_config(page_title="UAnalyze Email Login Test", layout="wide")
+st.set_page_config(page_title="UAnalyze Email Login Test v2", layout="wide")
 
-st.title("UAnalyze Email 登入診斷版")
-st.caption("測試 Streamlit 雲端瀏覽器是否能用 UAnalyze 原生 Email / 密碼登入。密碼只在當次執行使用，不會寫入 ZIP。")
+st.title("UAnalyze Email 登入診斷版 v2")
+st.caption("這版會用真人鍵盤輸入方式測試 Email / 密碼登入。密碼不會寫入檔案。")
 
 login_url = st.text_input(
     "UAnalyze 登入頁網址",
@@ -20,7 +20,7 @@ login_url = st.text_input(
 email = st.text_input("UAnalyze Email")
 password = st.text_input("UAnalyze 密碼", type="password")
 
-wait_seconds = st.slider("按下登入後等待秒數", 5, 40, 15)
+wait_seconds = st.slider("按下登入後等待秒數", 5, 45, 20)
 
 
 def install_playwright_chromium():
@@ -43,93 +43,102 @@ def try_click_text(page, text):
 def close_blockers(page):
     actions = []
 
-    # 處理「有新版本，請重新整理」
-    if try_click_text(page, "重新整理"):
-        actions.append("clicked 重新整理")
-        page.wait_for_timeout(5000)
+    try:
+        if page.get_by_text("重新整理", exact=False).count() > 0:
+            page.get_by_text("重新整理", exact=False).first.click(timeout=4000)
+            actions.append("clicked 重新整理")
+            page.wait_for_timeout(6000)
+    except Exception:
+        pass
 
     try:
         body = page.locator("body").inner_text(timeout=5000)
         if "系統已有更新" in body or "請重新整理" in body:
             page.reload(wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(7000)
             actions.append("page.reload")
     except Exception:
         pass
 
-    # 處理 Cookie
     for t in ["我知道了", "同意", "接受", "接受所有", "OK"]:
-        if try_click_text(page, t):
-            actions.append(f"clicked cookie/button: {t}")
-            page.wait_for_timeout(1500)
-            break
+        try:
+            if page.get_by_text(t, exact=False).count() > 0:
+                page.get_by_text(t, exact=False).last.click(timeout=4000)
+                actions.append(f"clicked {t}")
+                page.wait_for_timeout(1500)
+                break
+        except Exception:
+            pass
 
     return actions
 
 
-def fill_login_form(page, email, password):
-    """
-    針對一般登入表單：
-    - 找 visible input
-    - type=password 填密碼
-    - 其他第一個文字欄位填 email
-    """
-    result = page.evaluate(
-        """
-        ({email, password}) => {
-            function visible(el) {
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return r.width > 5 &&
-                       r.height > 5 &&
-                       s.display !== 'none' &&
-                       s.visibility !== 'hidden' &&
-                       s.opacity !== '0';
-            }
+def fill_like_human(page, email, password):
+    actions = []
 
-            function setValue(el, value) {
-                el.focus();
-                el.value = value;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            }
+    # 找 Email 欄位
+    email_candidates = [
+        "input[placeholder*='Email']",
+        "input[placeholder*='email']",
+        "input[type='email']",
+        "input:not([type])",
+        "input[type='text']",
+    ]
 
-            const inputs = Array.from(document.querySelectorAll('input'))
-                .filter(visible);
+    email_filled = False
 
-            const passwordInput = inputs.find(i => (i.type || '').toLowerCase() === 'password');
+    for selector in email_candidates:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0:
+                loc.click(timeout=5000)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(email, delay=60)
+                actions.append(f"typed email by {selector}")
+                email_filled = True
+                break
+        except Exception:
+            pass
 
-            const emailInput = inputs.find(i => {
-                const type = (i.type || '').toLowerCase();
-                const ph = (i.placeholder || '').toLowerCase();
-                const name = (i.name || '').toLowerCase();
-                return type === 'email' ||
-                       ph.includes('email') ||
-                       name.includes('email') ||
-                       (!['password', 'checkbox', 'radio', 'submit', 'button'].includes(type));
-            });
+    # 找密碼欄位
+    password_filled = False
 
-            if (emailInput) setValue(emailInput, email);
-            if (passwordInput) setValue(passwordInput, password);
+    try:
+        loc = page.locator("input[type='password']").first
+        if loc.count() > 0:
+            loc.click(timeout=5000)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            page.keyboard.type(password, delay=70)
+            actions.append("typed password by input[type=password]")
+            password_filled = True
+    except Exception:
+        pass
 
-            return {
-                input_count: inputs.length,
-                has_email_input: !!emailInput,
-                has_password_input: !!passwordInput,
-                email_placeholder: emailInput ? emailInput.placeholder : '',
-                password_placeholder: passwordInput ? passwordInput.placeholder : ''
-            };
-        }
-        """,
-        {"email": email, "password": password},
-    )
+    page.wait_for_timeout(1500)
 
-    page.wait_for_timeout(1000)
-    return result
+    return {
+        "email_filled": email_filled,
+        "password_filled": password_filled,
+        "actions": actions,
+    }
 
 
-def click_native_login_button(page):
-    # 避免點到 Google / Facebook / Apple 登入，優先點「純登入」按鈕
+def click_login(page):
+    methods = []
+
+    # 方法 1：找 button 裡面文字剛好是登入
+    try:
+        buttons = page.locator("button").filter(has_text="登入")
+        if buttons.count() > 0:
+            buttons.last.click(timeout=5000)
+            methods.append("clicked button has_text 登入")
+            return methods
+    except Exception:
+        pass
+
+    # 方法 2：找任意可見元素，排除 Google/Facebook/Apple
     try:
         clicked = page.evaluate(
             """
@@ -150,35 +159,45 @@ def click_native_login_button(page):
                         el,
                         text: (el.innerText || '').trim(),
                         top: el.getBoundingClientRect().top,
-                        len: ((el.innerText || '').trim()).length
                     }))
-                    .filter(x => x.text === '登入' || x.text === '登 入');
+                    .filter(x =>
+                        (x.text === '登入' || x.text === '登 入') &&
+                        !x.text.includes('Google') &&
+                        !x.text.includes('Facebook') &&
+                        !x.text.includes('Apple')
+                    )
+                    .sort((a, b) => a.top - b.top);
 
                 if (!nodes.length) return false;
 
-                nodes.sort((a, b) => a.top - b.top || a.len - b.len);
-                const target = nodes[nodes.length - 1].el;
-                target.scrollIntoView({block: 'center'});
-                target.click();
+                nodes[nodes.length - 1].el.scrollIntoView({block: 'center'});
+                nodes[nodes.length - 1].el.click();
                 return true;
             }
             """
         )
+
         if clicked:
-            return "JS clicked native 登入"
+            methods.append("JS clicked native login")
+            return methods
     except Exception:
         pass
 
+    # 方法 3：密碼欄位 Enter
     try:
-        page.get_by_text("登入", exact=True).last.click(timeout=5000)
-        return "get_by_text 登入 last"
+        page.locator("input[type='password']").first.click(timeout=5000)
+        page.keyboard.press("Enter")
+        methods.append("pressed Enter in password field")
+        return methods
     except Exception:
-        return ""
+        pass
+
+    return methods
 
 
-if st.button("測試 Email / 密碼登入"):
+if st.button("測試 Email 登入 v2"):
     if not email or not password:
-        st.error("請先在上方輸入 Email 和密碼。")
+        st.error("請先輸入 Email 和密碼。")
         st.stop()
 
     st.info("開始檢查 Playwright Chromium，這一步可能需要 1～3 分鐘。")
@@ -201,7 +220,6 @@ if st.button("測試 Email / 密碼登入"):
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
                 ],
             )
 
@@ -216,13 +234,8 @@ if st.button("測試 Email / 密碼登入"):
 
             page = context.new_page()
 
-            response = page.goto(
-                login_url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-
-            page.wait_for_timeout(5000)
+            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
 
             blocker_actions = close_blockers(page)
             page.wait_for_timeout(3000)
@@ -232,10 +245,15 @@ if st.button("測試 Email / 密碼登入"):
             before_text = page.locator("body").inner_text(timeout=10000)
             before_screenshot = page.screenshot(full_page=True)
 
-            fill_result = fill_login_form(page, email, password)
+            fill_result = fill_like_human(page, email, password)
             filled_screenshot = page.screenshot(full_page=True)
 
-            click_method = click_native_login_button(page)
+            login_methods = click_login(page)
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
 
             page.wait_for_timeout(wait_seconds * 1000)
 
@@ -251,13 +269,10 @@ if st.button("測試 Email / 密碼登入"):
 
             browser.close()
 
-        status = response.status if response else "無 response"
-
         st.subheader("處理結果")
-        st.write("HTTP 狀態碼：", status)
         st.write("彈窗 / Cookie 處理動作：", blocker_actions)
         st.write("填表結果：", fill_result)
-        st.write("登入按鈕點擊方法：", click_method or "沒有成功點擊")
+        st.write("登入點擊方法：", login_methods)
 
         st.subheader("登入前狀態")
         st.write("登入前標題：", before_title)
@@ -275,23 +290,33 @@ if st.button("測試 Email / 密碼登入"):
         st.subheader("登入後頁面文字")
         st.text_area("after body text", after_text, height=300)
 
+        success_hint = (
+            "login-page" not in after_url
+            and "Google 登入" not in after_text
+            and "Facebook 登入" not in after_text
+            and "Apple 登入" not in after_text
+        )
+
+        if success_hint:
+            st.success("看起來可能已經登入成功。")
+        else:
+            st.warning("看起來仍停在登入頁，這次尚未成功登入。")
+
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"uanalyze_email_login_debug_{now}.zip"
+        zip_name = f"uanalyze_email_login_v2_debug_{now}.zip"
 
         zip_buffer = io.BytesIO()
 
-        # 注意：不寫入 email/password
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("before_body_text.txt", before_text)
             z.writestr("after_body_text.txt", after_text)
             z.writestr(
                 "debug_info.txt",
-                f"status={status}\n"
                 f"blocker_actions={blocker_actions}\n"
                 f"before_title={before_title}\n"
                 f"before_url={before_url}\n"
                 f"fill_result={fill_result}\n"
-                f"click_method={click_method}\n"
+                f"login_methods={login_methods}\n"
                 f"after_title={after_title}\n"
                 f"after_url={after_url}\n"
             )
@@ -302,12 +327,12 @@ if st.button("測試 Email / 密碼登入"):
         zip_buffer.seek(0)
 
         st.download_button(
-            label="下載 Email 登入診斷 ZIP",
+            label="下載 Email 登入 v2 診斷 ZIP",
             data=zip_buffer,
             file_name=zip_name,
             mime="application/zip",
         )
 
     except Exception as e:
-        st.error("Email / 密碼登入流程診斷失敗。")
+        st.error("Email 登入 v2 診斷失敗。")
         st.exception(e)
