@@ -7,29 +7,88 @@ from datetime import datetime
 import streamlit as st
 
 
-st.set_page_config(page_title="UAnalyze Crawler App", layout="wide")
+st.set_page_config(page_title="UAnalyze Login Diagnostic", layout="wide")
 
-st.title("UAnalyze 雲端瀏覽器診斷版")
-st.caption("先確認 Streamlit 雲端瀏覽器實際看到 UAnalyze 的什麼畫面。")
+st.title("UAnalyze 登入流程診斷版")
+st.caption("這一步只測試雲端瀏覽器點 Google 登入後會看到什麼畫面，不要輸入任何帳號密碼。")
 
 company = st.text_input("請輸入公司代號與名稱", value="3030_德律")
 
-test_url = st.text_input(
-    "測試網址",
+login_url = st.text_input(
+    "UAnalyze 登入頁網址",
     value="https://pro.uanalyze.com.tw/login-page",
 )
 
-wait_seconds = st.slider("進入頁面後等待秒數", 3, 20, 8)
+wait_seconds = st.slider("點擊 Google 登入後等待秒數", 5, 30, 10)
 
-if st.button("開始診斷 UAnalyze 頁面"):
-    st.info("開始檢查 Playwright Chromium，這一步可能需要 1～3 分鐘。")
 
-    install = subprocess.run(
+def install_playwright_chromium():
+    return subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
         capture_output=True,
         text=True,
         timeout=240,
     )
+
+
+def click_google_login(page):
+    # 方法 1：直接找文字
+    try:
+        page.get_by_text("Google 登入").click(timeout=5000)
+        return "get_by_text Google 登入"
+    except Exception:
+        pass
+
+    # 方法 2：掃描所有可見元素，找包含 Google 的按鈕或文字
+    try:
+        ok = page.evaluate(
+            """
+            () => {
+                function visible(el) {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 5 &&
+                           r.height > 5 &&
+                           s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           s.opacity !== '0';
+                }
+
+                const nodes = Array.from(document.querySelectorAll(
+                    'button, a, div, span, p'
+                ));
+
+                const matches = nodes
+                    .filter(el => visible(el))
+                    .filter(el => (el.innerText || '').includes('Google'))
+                    .map(el => ({
+                        el,
+                        text: (el.innerText || '').trim(),
+                        len: ((el.innerText || '').trim()).length,
+                        top: el.getBoundingClientRect().top
+                    }))
+                    .sort((a, b) => a.len - b.len || a.top - b.top);
+
+                if (!matches.length) return false;
+
+                matches[0].el.scrollIntoView({block: 'center'});
+                matches[0].el.click();
+                return true;
+            }
+            """
+        )
+        if ok:
+            return "JS visible Google element"
+    except Exception:
+        pass
+
+    return ""
+
+
+if st.button("測試 Google 登入流程"):
+    st.info("開始檢查 Playwright Chromium，這一步可能需要 1～3 分鐘。")
+
+    install = install_playwright_chromium()
 
     if install.returncode != 0:
         st.error("Playwright Chromium 安裝失敗。")
@@ -61,59 +120,93 @@ if st.button("開始診斷 UAnalyze 頁面"):
             )
 
             response = page.goto(
-                test_url,
+                login_url,
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
 
-            page.wait_for_timeout(wait_seconds * 1000)
+            page.wait_for_timeout(5000)
 
-            title = page.title()
-            final_url = page.url
+            before_title = page.title()
+            before_url = page.url
+            before_text = page.locator("body").inner_text(timeout=10000)
+            before_screenshot = page.screenshot(full_page=True)
 
-            try:
-                body_text = page.locator("body").inner_text(timeout=10000)
-            except Exception:
-                body_text = ""
+            click_method = click_google_login(page)
 
-            html = page.content()
-            screenshot_bytes = page.screenshot(full_page=True)
+            if not click_method:
+                after_title = page.title()
+                after_url = page.url
+                after_text = page.locator("body").inner_text(timeout=10000)
+                after_screenshot = page.screenshot(full_page=True)
+                browser.close()
 
-            browser.close()
+                st.error("找不到 Google 登入按鈕，或無法點擊。")
+                st.write("點擊方法：", "無")
+            else:
+                page.wait_for_timeout(wait_seconds * 1000)
+
+                after_title = page.title()
+                after_url = page.url
+
+                try:
+                    after_text = page.locator("body").inner_text(timeout=10000)
+                except Exception:
+                    after_text = ""
+
+                after_screenshot = page.screenshot(full_page=True)
+                browser.close()
+
+                st.success("已點擊 Google 登入，並完成等待。")
+                st.write("點擊方法：", click_method)
 
         status = response.status if response else "無 response"
 
-        st.success("診斷完成。")
+        st.subheader("登入前狀態")
         st.write("HTTP 狀態碼：", status)
-        st.write("頁面標題：", title)
-        st.write("最後網址：", final_url)
+        st.write("登入前標題：", before_title)
+        st.write("登入前網址：", before_url)
 
-        st.subheader("雲端瀏覽器截圖")
-        st.image(screenshot_bytes)
+        st.image(before_screenshot, caption="登入前截圖")
 
-        st.subheader("抓到的頁面文字")
-        st.text_area("body text", body_text, height=250)
+        st.subheader("點擊 Google 登入後狀態")
+        st.write("登入後標題：", after_title)
+        st.write("登入後網址：", after_url)
+
+        st.image(after_screenshot, caption="點擊 Google 登入後截圖")
+
+        st.subheader("登入後頁面文字")
+        st.text_area("after body text", after_text, height=300)
 
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"{company}_uanalyze_debug_{now}.zip"
+        zip_name = f"{company}_google_login_debug_{now}.zip"
 
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("debug_body_text.txt", body_text)
-            z.writestr("debug_page.html", html)
-            z.writestr("debug_info.txt", f"status={status}\ntitle={title}\nurl={final_url}\n")
-            z.writestr("debug_screenshot.png", screenshot_bytes)
+            z.writestr("before_body_text.txt", before_text)
+            z.writestr("after_body_text.txt", after_text)
+            z.writestr(
+                "debug_info.txt",
+                f"status={status}\n"
+                f"before_title={before_title}\n"
+                f"before_url={before_url}\n"
+                f"click_method={click_method}\n"
+                f"after_title={after_title}\n"
+                f"after_url={after_url}\n"
+            )
+            z.writestr("before_screenshot.png", before_screenshot)
+            z.writestr("after_screenshot.png", after_screenshot)
 
         zip_buffer.seek(0)
 
         st.download_button(
-            label="下載診斷 ZIP",
+            label="下載 Google 登入診斷 ZIP",
             data=zip_buffer,
             file_name=zip_name,
             mime="application/zip",
         )
 
     except Exception as e:
-        st.error("診斷失敗。")
+        st.error("Google 登入流程診斷失敗。")
         st.exception(e)
