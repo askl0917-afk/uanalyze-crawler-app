@@ -1,43 +1,37 @@
-# UAnalyze 產業情報小助理爬蟲
+# UAnalyze Crawler App - Long Run Mode
 
-## 本版重點
+這是 UAnalyze 產業情報小助理 / 虎八速覽的 Streamlit 長時間爬蟲版。
 
-- 股票輸入欄位只需要股票代號，例如 `3030`
-- 如果你輸入 `3030_德律`，程式會自動轉成 `3030`
-- 爬蟲會先切換股票，再檢查頁面實際股票代號
-- 如果頁面仍停在 `1101 台泥`，預設會停止，避免抓錯公司
-- 支援長等待時間，不需要分批爬
-- 結果支援一鍵複製、下載 ZIP
+## 檔案
 
-## Streamlit Cloud 部署
+- `app.py`：主程式
+- `requirements.txt`：Python 套件
+- `packages.txt`：Streamlit Cloud Linux 系統套件
+- `.streamlit/config.toml`：Streamlit 基本設定
 
-上傳 / 覆蓋以下檔案：
+## 更新方式
 
-- app.py
-- requirements.txt
-- packages.txt
-- README.md
+1. 解壓縮 ZIP。
+2. 到 GitHub repo：`askl0917-afk/uanalyze-crawler-app`。
+3. 上傳 / 覆蓋：
+   - `app.py`
+   - `requirements.txt`
+   - `packages.txt`
+   - `README.md`
+   - `.streamlit/config.toml`
+4. Commit changes。
+5. 回 Streamlit App，Manage app → Reboot / Deploy。
 
-`.streamlit/config.toml` 是外觀設定，手機可能看不到隱藏資料夾，不影響核心爬蟲。
+## 使用建議
 
-## 使用方式
-
-1. 打開 Streamlit app
-2. 輸入 UAnalyze Email / 密碼
-3. 股票代號輸入 `3030`
-4. 選擇要爬的欄位
-5. 點擊「開始爬取產業情報欄位」
-6. 成功後按「一鍵複製」或下載 ZIP
-
-## 注意
-
-如果切換股票失敗，App 會停止，這是刻意設計，避免把錯的公司資料存成目標公司。
+- 手機長時間爬取時，不要切 App、不要鎖螢幕。
+- 不建議勾選「保存每個欄位截圖」，會變慢且耗資源。
+- 若畫面中途斷線，重新整理後可在「最近完成 / 暫存結果」下載已寫入的結果。
 
 
-## v3 修正
+## Enter 修正版
 
-如果 Streamlit Cloud 沒有正確讀到 requirements.txt，畫面會出現：
-`No module named playwright`
-
-本版在 app.py 內加入保險機制，啟動時會自動補裝 playwright。
-但 GitHub 根目錄仍建議保留正確檔名：`requirements.txt`。
+- 股票欄位只輸入數字，例如 3030。
+- 切換股票時會輸入股票代號後直接按 Enter。
+- 若頁面仍停在其他股票，例如 1101，App 會停止爬蟲並提供診斷 ZIP，避免爬錯公司。
+- 若 Streamlit 沒吃到 requirements.txt，App 會嘗試在啟動時自動 pip install playwright。
